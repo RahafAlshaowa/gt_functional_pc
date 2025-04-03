@@ -10,6 +10,7 @@ import open3d as o3d
 import numpy as np
 
 from mesh_utils import classify_multiple_points, generate_kdtrees, load_pc_and_split
+from utils import timeit_decorator
 
 
 class Visualizer:
@@ -261,6 +262,34 @@ def get_world_to_object_transform(object: RigidObject):
     return pos, quat
 
 
+@timeit_decorator
+def calculate_classified_pc(scene, gt_trees):
+    points_o_c = generate_pc(scene["cam"])  # observed points in camera frame
+
+    pos_c_w, quat_c_w = get_camera_to_world_transform(scene["cam"])
+    points_o_w = transform_points(  # observed points in world frame
+        points_o_c,
+        pos_c_w,
+        quat_c_w,
+    )
+
+    pos_w_o, quat_w_o = get_world_to_object_transform(scene["obj"])
+    points_o_o = transform_points(  # observed points in object frame
+        points_o_w,
+        pos_w_o,
+        quat_w_o,
+    )
+
+    query_classes = classify_multiple_points(points_o_o.cpu().numpy(), gt_trees)
+    query_colors = np.array([COLORS[query_class] for query_class in query_classes])
+
+    pc_classified = o3d.geometry.PointCloud()
+    pc_classified.points = o3d.utility.Vector3dVector(points_o_w.cpu().numpy())
+    pc_classified.colors = o3d.utility.Vector3dVector(query_colors)
+
+    return pc_classified
+
+
 def main():
     gt_trees = get_gt_pc()
 
@@ -270,7 +299,6 @@ def main():
     sim.set_camera_view((2.5, 2.5, 2.5), (0.0, 0.0, 0.0))
     sim_dt = sim.get_physics_dt()
 
-    # scene = design_scene()
     scene_cfg = MySceneCfg()
     scene = InteractiveScene(cfg=scene_cfg)
 
@@ -290,31 +318,8 @@ def main():
         sim.step()
         scene.update(sim_dt)
 
-        points_o_c = generate_pc(scene["cam"])  # observed points in camera frame
-
-        pos_c_w, quat_c_w = get_camera_to_world_transform(scene["cam"])
-        points_o_w = transform_points(  # observed points in world frame
-            points_o_c,
-            pos_c_w,
-            quat_c_w,
-        )
-
-        pos_w_o, quat_w_o = get_world_to_object_transform(scene["obj"])
-        points_o_o = transform_points(  # observed points in object frame
-            points_o_w,
-            pos_w_o,
-            quat_w_o,
-        )
-
-        query_classes = classify_multiple_points(points_o_o.cpu().numpy(), gt_trees)
-        query_colors = np.array([COLORS[query_class] for query_class in query_classes])
-
-        pc_classified = o3d.geometry.PointCloud()
-        pc_classified.points = o3d.utility.Vector3dVector(points_o_w.cpu().numpy())
-        pc_classified.colors = o3d.utility.Vector3dVector(query_colors)
-
-        if step % 10 == 0 and points_o_c.shape[0] > 0:
-            pc_vis.update(pc_classified)
+        pc_classified = calculate_classified_pc(scene, gt_trees)
+        pc_vis.update(pc_classified)
 
 
 if __name__ == "__main__":
