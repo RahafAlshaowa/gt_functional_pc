@@ -9,6 +9,8 @@ import cv2
 import open3d as o3d
 import numpy as np
 
+from mesh_utils import classify_multiple_points, generate_kdtrees, load_pc_and_split
+
 
 class Visualizer:
     def __init__(self, visualize_pc):
@@ -25,7 +27,12 @@ class Visualizer:
     def update(self, points):
         if not self.vis:
             return
-        self.pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
+        if not isinstance(points, o3d.geometry.PointCloud):
+            self.pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
+        else:
+            self.pcd.points = points.points
+            self.pcd.colors = points.colors
+
         if self.first:
             self.vis.clear_geometries()
             self.vis.add_geometry(self.pcd)
@@ -44,6 +51,11 @@ parser.add_argument(
     "--mesh_path",
     type=str,
     help="Path to the mesh file. The mesh file should be in usd format, or a format that can be converted to usd.",
+)
+parser.add_argument(
+    "--gt_pc_path",
+    type=str,
+    help="Path to the ground truth point cloud file. The point cloud file should be in ply format.",
 )
 parser.add_argument(
     "--scale",
@@ -86,6 +98,8 @@ from isaaclab.utils.math import (
 CAM_POS = np.array([0.0, 0.0, 3.5])
 CAM_ROT = R.from_euler("xyz", [180, 0, 0], degrees=True)
 pc_vis = Visualizer(args_cli.visualize_pc)
+
+COLORS = [np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])]
 
 
 def get_object_usd():
@@ -214,10 +228,42 @@ def generate_pc(camera: Camera):
 def get_camera_to_world_transform(camera: Camera):
     pos = camera.data.pos_w
     quat = camera.data.quat_w_ros
-    return (pos, quat)
+    return pos, quat
+
+
+def get_gt_pc():
+    pc_dir = os.path.dirname(args_cli.gt_pc_path)
+    pc_name = os.path.basename(args_cli.gt_pc_path)
+    pcs = load_pc_and_split(pc_dir, pc_name)
+
+    for pc in pcs:
+        # pc.points = torch.tensor(pc.points) * args_cli.scale
+        pc.points = o3d.utility.Vector3dVector(
+            torch.tensor(np.array(pc.points)) * args_cli.scale
+        )
+
+    pc_trees = generate_kdtrees(pcs)
+    return pc_trees
+
+
+def get_object_to_world_transform(object: RigidObject):
+    pos = object.data.root_pos_w
+    quat = object.data.root_quat_w
+
+    return pos, quat
+
+
+def get_world_to_object_transform(object: RigidObject):
+    pos = object.data.root_pos_w
+    quat = object.data.root_quat_w
+
+    pos, quat = subtract_frame_transforms(pos, quat)
+    return pos, quat
 
 
 def main():
+    gt_trees = get_gt_pc()
+
     sim_cfg = SimulationCfg(dt=0.01, device=args_cli.device)
     sim = SimulationContext(sim_cfg)
 
@@ -244,21 +290,31 @@ def main():
         sim.step()
         scene.update(sim_dt)
 
-        points_o_c = generate_pc(scene["cam"])
-        if step % 10 == 0 and points_o_c.shape[0] > 0:
-            pc_vis.update(points_o_c)
+        points_o_c = generate_pc(scene["cam"])  # observed points in camera frame
 
-        (pos0, quat0), _ = get_camera_to_world_transform(scene["cam"])
-
-        points_o_w = transform_points(
+        pos_c_w, quat_c_w = get_camera_to_world_transform(scene["cam"])
+        points_o_w = transform_points(  # observed points in world frame
             points_o_c,
-            pos0,
-            quat0,
+            pos_c_w,
+            quat_c_w,
         )
 
-        center = torch.mean(points_o_w, dim=0)
-        print("Center of points: ", center)
-        print("Object position : ", object_state[0, :3])
+        pos_w_o, quat_w_o = get_world_to_object_transform(scene["obj"])
+        points_o_o = transform_points(  # observed points in object frame
+            points_o_w,
+            pos_w_o,
+            quat_w_o,
+        )
+
+        query_classes = classify_multiple_points(points_o_o.cpu().numpy(), gt_trees)
+        query_colors = np.array([COLORS[query_class] for query_class in query_classes])
+
+        pc_classified = o3d.geometry.PointCloud()
+        pc_classified.points = o3d.utility.Vector3dVector(points_o_w.cpu().numpy())
+        pc_classified.colors = o3d.utility.Vector3dVector(query_colors)
+
+        if step % 10 == 0 and points_o_c.shape[0] > 0:
+            pc_vis.update(pc_classified)
 
 
 if __name__ == "__main__":
