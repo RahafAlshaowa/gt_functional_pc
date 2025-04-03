@@ -4,6 +4,37 @@ import torch
 from isaaclab.app import AppLauncher
 import os
 import tempfile
+import matplotlib.pyplot as plt
+import cv2
+import open3d as o3d
+import numpy as np
+
+
+class Visualizer:
+    def __init__(self, visualize_pc):
+        if not visualize_pc:
+            return
+        self.vis = o3d.visualization.Visualizer()
+        self.vis.create_window()
+        self.first = True
+        self.pcd = o3d.geometry.PointCloud()
+        self.vis.add_geometry(self.pcd)
+        view_ctl = self.vis.get_view_control()
+        view_ctl.set_zoom(0.5)
+
+    def update(self, points):
+        if not self.vis:
+            return
+        self.pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
+        if self.first:
+            self.vis.clear_geometries()
+            self.vis.add_geometry(self.pcd)
+            self.first = False
+        else:
+            self.vis.update_geometry(self.pcd)
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            self.vis.reset_view_point(True)
 
 
 parser = argparse.ArgumentParser(
@@ -20,11 +51,17 @@ parser.add_argument(
     default=0.001,
     help="Scale of the object. Defaults to 0.001.",
 )
+parser.add_argument(
+    "--visualize_pc",
+    action="store_true",
+    help="Visualize the point cloud using open3d.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+from isaaclab.sensors import Camera, FrameTransformerCfg
 from isaaclab.sim import SimulationCfg, SimulationContext, configclass
 import isaaclab.sim as sim_utils
 from mesh_convert import convert_mesh
@@ -32,15 +69,23 @@ from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObject
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sensors.camera import CameraCfg
-import numpy as np
 from scipy.spatial.transform import Rotation as R
 from isaaclab.scene import InteractiveSceneCfg, InteractiveScene
+from isaaclab.utils.math import (
+    unproject_depth,
+    subtract_frame_transforms,
+    transform_points,
+)
 
 # from isaaclab.assets.rigid_object.rigid_object_data import RigidObjectData
 
 
-CAM_POS = np.array([1.955, -1.29826, 0.64681])
-CAM_ROT = R.from_quat([-0.1423, 0.0799, 0.90374, 0.39126])
+# CAM_POS = np.array([1.8, -2.5, 2.33])
+# CAM_ROT = R.from_quat([-0.1423, 0.0799, 0.90374, 0.39126])
+
+CAM_POS = np.array([0.0, 0.0, 3.5])
+CAM_ROT = R.from_euler("xyz", [180, 0, 0], degrees=True)
+pc_vis = Visualizer(args_cli.visualize_pc)
 
 
 def get_object_usd():
@@ -105,27 +150,23 @@ class MySceneCfg(InteractiveSceneCfg):
     )
     cam = CameraCfg(
         prim_path="/World/Camera",
-        update_period=0.05,
-        height=720,
-        width=480,
-        colorize_semantic_segmentation=True,
-        semantic_filter="class: object | ground",
+        height=480,
+        width=720,
         data_types=[
             "rgb",
             "distance_to_camera",
-            "instance_id_segmentation_fast",
+            "instance_segmentation_fast",
         ],
+        colorize_instance_segmentation=False,
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 1.0e5),
         ),
         offset=CameraCfg.OffsetCfg(
             pos=tuple(CAM_POS.tolist()),
             rot=tuple(CAM_ROT.as_quat()[[3, 0, 1, 2]].tolist()),
-            convention="world",
+            convention="ros",
         ),
+        debug_vis=True,
     )
 
 
@@ -144,6 +185,36 @@ def object_trajectory(t):
     return torch.tensor(
         [x, y, z, quaternion[3], quaternion[0], quaternion[1], quaternion[2]]
     )
+
+
+def generate_pc(camera: Camera):
+    img_rgb = camera.data.output["rgb"]
+    dist_to_cam = camera.data.output["distance_to_camera"]
+    instance_seg = camera.data.output["instance_segmentation_fast"]
+
+    instanec_seg_info = camera.data.info[0]["instance_segmentation_fast"]
+    id_object = -1
+    for id, info in instanec_seg_info["idToSemantics"].items():
+        if info["class"] == "object":
+            id_object = id
+            break
+    mask = instance_seg == id_object
+    dist_to_cam = dist_to_cam * mask
+    dist_to_cam[torch.isnan(dist_to_cam)] = 0.0
+
+    points = unproject_depth(
+        depth=dist_to_cam,
+        intrinsics=camera.data.intrinsic_matrices,
+        is_ortho=False,
+    )
+    points = points[points[..., 2] > 0]
+    return points
+
+
+def get_camera_to_world_transform(camera: Camera):
+    pos = camera.data.pos_w
+    quat = camera.data.quat_w_ros
+    return (pos, quat)
 
 
 def main():
@@ -172,12 +243,22 @@ def main():
         step += 1
         sim.step()
         scene.update(sim_dt)
-        img_rgb = scene["cam"].data.output["rgb"]
-        dist_to_cam = scene["cam"].data.output["distance_to_camera"]
-        instance_id = scene["cam"].data.output["instance_id_segmentation_fast"]
 
-        print(scene["obj"].__dict__)
-        print(scene["obj"].data.root_state_w)
+        points_o_c = generate_pc(scene["cam"])
+        if step % 10 == 0 and points_o_c.shape[0] > 0:
+            pc_vis.update(points_o_c)
+
+        (pos0, quat0), _ = get_camera_to_world_transform(scene["cam"])
+
+        points_o_w = transform_points(
+            points_o_c,
+            pos0,
+            quat0,
+        )
+
+        center = torch.mean(points_o_w, dim=0)
+        print("Center of points: ", center)
+        print("Object position : ", object_state[0, :3])
 
 
 if __name__ == "__main__":
